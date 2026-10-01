@@ -7,9 +7,14 @@ services:
     environment:
       # 容器内本地信任文件路径(由下方只读挂载提供)
       RECALL_TRUST_FILE: /srv/trust/recall-keys.json
+      # 容器内单包撤销名单路径(由下方只读挂载提供);
+      # 宿主机原子替换该文件后,下一次请求即生效,无需重启容器
+      RECALL_REVOKED_FILE: /srv/trust/revoked-packages.json
     volumes:
       # 本地信任文件只读挂载;轮换密钥时在宿主机替换此文件即可,不联网取钥
       - ./trust/recall-keys.json:/srv/trust/recall-keys.json:ro
+      # 单包撤销名单只读挂载;元素为包标识 SHA-256(header.payload)的 64 位小写十六进制摘要
+      - ./trust/revoked-packages.json:/srv/trust/revoked-packages.json:ro
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]

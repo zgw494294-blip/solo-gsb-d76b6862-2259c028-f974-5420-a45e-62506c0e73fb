@@ -4,7 +4,7 @@
 
 - **重放内核**(`app/replay.py`):以 GTIN + AI 21 序列号为共享身份,统一维护父子边、持有人、成功事件下标与地点历史;提供逐事件命令 `transfer` / `pack` / `unpack` 与三套策略配置(`ReplayConfig.packing()` / `.custody()` / `.trace()`)。每条命令先全部校验通过再一次性提交,失败命令不留任何半次更新。
 - **召回核验**:上传一批扫描串和一批召回规则,逐条返回解析出的字段(GTIN / 批号 / 序列号 / 日期)以及命中的规则 ID。
-- **签名召回核验**:扫描串之外,召回规则装在 compact JWS(EdDSA / Ed25519 签名)载荷里;先验签名、有效期与授权 GTIN 前缀,全部通过才返回 kid 与原扫码核验结果。公钥只来自本地信任文件。
+- **签名召回核验**:扫描串之外,召回规则装在 compact JWS(EdDSA / Ed25519 签名)载荷里;先验签名、有效期与授权 GTIN 前缀,全部通过才返回 kid 与原扫码核验结果。公钥只来自本地信任文件。另支持**单包撤销**:配置本地 JSON 撤销名单后,名单命中的规则包(按 `SHA-256(header.payload)` 标识,与签名段编码无关)即使仍在有效期内也返回 403,不连带同一 kid 的其他包。
 - **召回规则关系分析**:上传 2~100 条召回规则,上线前找出不可能命中任何合法扫描串的规则,以及命中集合有交集的规则对(等价 / 包含 / 部分相交),每对附一条同时命中两者的证据扫描串。
 - **交接审计**:上传一批实物交接事件,按时间重放并审计每件实物(GTIN + 序列号)的持有人流转,返回成功事件与失败原因。
 - **交接日志最少剔除**:上传 1~300 条现有格式交接事件及可选的锁定事件原下标,选择剔除总数最少的保留子序列(合法交接链、批号 / 有效期一致、锁定必留),返回处理顺序的保留下标、原下标升序的剔除下标与各保留实物的最终持有人。
@@ -51,8 +51,10 @@ failure = kernel.unpack(index, parent_key, child_key)
 docker compose up --build
 ```
 
-> 容器把宿主机的 `trust/recall-keys.json` **只读挂载**到 `/srv/trust/recall-keys.json`,
-> 服务启动后仍可在宿主机替换文件完成密钥轮换,**不联网取钥**。生产环境请用自己的信任文件替换样例。
+> 容器把宿主机的 `trust/recall-keys.json` 与 `trust/revoked-packages.json`(单包撤销名单)
+> **只读挂载**到 `/srv/trust/` 下,服务启动后仍可在宿主机**原子替换**文件完成密钥轮换或
+> 撤销更新(撤销名单**每次请求读盘一次**,下一次请求即生效,无需重启容器),**不联网取钥**。
+> 生产环境请用自己的信任文件与撤销名单替换样例。
 
 服务监听 **8000** 端口:
 
@@ -74,6 +76,8 @@ docker compose up --build
 pip install -r requirements.txt
 # 信任文件路径可用环境变量覆盖,默认 trust/recall-keys.json(相对工作目录)
 export RECALL_TRUST_FILE=trust/recall-keys.json
+# 单包撤销名单(可选):不设置或留空则不启用撤销,check-signed 保持旧行为
+export RECALL_REVOKED_FILE=trust/revoked-packages.json
 uvicorn app.main:app --reload --port 8000
 ```
 
@@ -225,6 +229,7 @@ JWS **载荷**解码后是 JSON 对象,**仅含**三个键:
 3. **验签**:Ed25519 验证失败即拒绝。
 4. **时间窗**:须 `nbf ≤ now < exp`(下边界闭、上边界开)。
 5. **授权前缀**:载荷中**每条**规则的 14 位 GTIN 都须**至少匹配一个**该 kid 的授权前缀(1~14 位数字,按 GTIN 字符串前缀匹配;14 位前缀即精确相等)。
+6. **单包撤销**(仅当配置 `RECALL_REVOKED_FILE` 时):包标识 `SHA-256(header.payload 原始两段 ASCII 字节)`命中撤销名单即拒绝,即使包仍在有效期内;详见下文。
 
 状态码:
 
@@ -232,8 +237,8 @@ JWS **载荷**解码后是 JSON 对象,**仅含**三个键:
 | --- | --- |
 | **200** | 全部通过,返回 `kid` 与原扫码核验结果(逐条解析错误仍以 `ok:false` 内联返回,不影响其余条目) |
 | **422** | 请求体非法;JWS 段数 / 空段 / base64url / JSON / 重复键 / 头部或载荷字段错误;载荷规则非法(GTIN 校验位、ID 重复、日期倒置等) |
-| **403** | 未知 `kid`、签名验证失败、时间窗越期(`nbf > now` 或 `now ≥ exp`)、任一规则 GTIN 未获前缀授权 |
-| **500** | 本地信任文件缺失或内容非法(服务端配置问题) |
+| **403** | 未知 `kid`、签名验证失败、时间窗越期(`nbf > now` 或 `now ≥ exp`)、任一规则 GTIN 未获前缀授权、规则包命中本地撤销名单 |
+| **500** | 本地信任文件缺失或内容非法;**已配置**的撤销名单文件不可读、结构或元素非法(服务端配置问题,失败即拒绝,不沿用旧名单放行) |
 
 422 / 403 均**不返回任何匹配结果**。
 
@@ -282,6 +287,68 @@ curl -s http://localhost:8000/v1/recall/check-signed \
   -H 'Content-Type: application/json' \
   --data @examples/sample-check-signed.json
 ```
+
+#### 单包撤销(本地撤销名单)
+
+在验签、时间窗与 GTIN 授权全部通过之后,还可对**指定的单个规则包**做撤销:
+
+- 由环境变量 **`RECALL_REVOKED_FILE`** 指向一份本地 JSON 名单(默认不设置 / 空 = 不启用,接口保持旧行为);容器内为 `/srv/trust/revoked-packages.json`,由 Compose 只读挂载宿主机 `trust/revoked-packages.json`。
+- 名单**仅含**一个 `revoked` 数组,元素为 **64 位小写十六进制** SHA-256 摘要,**允许重复**(重复与单条等价);空数组表示当前没有任何包被撤销。
+- **包标识**取 JWS **原始前两段以点连接的 ASCII 字节**的 SHA-256(正是 Ed25519 的签名输入),与第三段签名无关——因此**签名段编码变化不影响标识**,重传同一头 / 载荷的包仍会命中;而载荷(规则 / 时间窗)或头部任一字节不同即为另一个包。撤销**只命中该包本身**,不连带撤销同一 `kid` 签发的其他包。
+- 服务对每次 check-signed 请求都重新读盘**一次**,不做缓存:在宿主机上**原子替换**名单文件后,**下一次请求即生效**,无需重启容器。
+- 已配置名单但文件**不可读、JSON 非法、结构或元素非法**时返回 **500** 且不返回匹配结果(**失败即拒绝**,不会沿用旧名单内容放行)。
+
+名单格式:
+
+```json
+{
+  "revoked": [
+    "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+  ]
+}
+```
+
+计算某个 JWS 的包标识(取前两段,不看签名段):
+
+```bash
+# jws=header.payload.signature,只取第一个点与第二个点之间的前两段
+printf '%s' "${jws%.*}" | sha256sum   # 输出的 64 位十六进制即包标识
+```
+
+```python
+import hashlib
+
+header_seg, payload_seg, _signature_seg = jws.split(".")
+digest = hashlib.sha256(f"{header_seg}.{payload_seg}".encode("ascii")).hexdigest()
+```
+
+在宿主机上替换名单(写到临时文件后原子改名,避免读到写一半的文件):
+
+```bash
+python3 - <<'PY'
+import json, os, tempfile
+path = "trust/revoked-packages.json"
+digest = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+directory = os.path.dirname(path) or "."
+fd, tmp = tempfile.mkstemp(dir=directory)
+with os.fdopen(fd, "w", encoding="utf-8") as fh:
+    json.dump({"revoked": [digest]}, fh)
+    fh.write("\n")
+os.replace(tmp, path)   # 原子替换;下一次 check-signed 请求即生效
+PY
+```
+
+撤销后再次调用同一接口,响应为 **403**(不返回匹配结果):
+
+```bash
+curl -s -i http://localhost:8000/v1/recall/check-signed \
+  -H 'Content-Type: application/json' \
+  --data @examples/sample-check-signed.json
+# HTTP/1.1 403 Forbidden
+# {"detail":"规则包已被撤销: 9f86d081...0a08"}
+```
+
+移除该摘要(或换成空数组)并再次原子替换后,包恢复为 200。请求体与成功响应结构均保持不变。
 
 ### `POST /v1/recall/rule-relations`
 
@@ -831,7 +898,8 @@ app/
   checker.py   # 扫码核验共享逻辑(check / check-signed 复用)
   jws.py       # compact JWS 辅助:无填充 base64url、拒绝重复 JSON 键
   trust.py     # 本地信任文件(kid -> Ed25519 公钥 + 授权 GTIN 前缀)
-  signed.py    # /v1/recall/check-signed:验签 / 时间窗 / 前缀授权
+  revoked.py   # 单包撤销名单(本地 JSON:revoked 摘要数组,每次请求读盘)
+  signed.py    # /v1/recall/check-signed:验签 / 时间窗 / 前缀授权 / 单包撤销
   relations.py # 召回规则关系分析(命中集合比较与证据扫描串构造)
   custody.py   # 实物交接审计适配层(扫描/链/批号有效期校验 + 结果整理,内核 custody 模式)
   trim.py      # 交接日志最少剔除(每实物后缀最长链 DP + 全局字典序贪心,锁定必留)
@@ -841,7 +909,7 @@ app/
   receiving.py # 到货核对(扫描解析/去重 + 最小费用最大流全局最优核销)
 tests/
   test_recall.py
-  test_recall_signed.py
+  test_recall_signed.py   # 含单包撤销(名单命中 / 不连带其他包 / 原子替换生效 / 名单非法 500)
   test_relations.py
   test_custody.py
   test_trim.py
@@ -854,6 +922,7 @@ scripts/
   generate_sample_keys.py   # 生成本地演示密钥、信任文件与请求样例
 trust/
   recall-keys.json           # 本地信任文件(Compose 只读挂载,不内置进镜像)
+  revoked-packages.json      # 单包撤销名单样例(空 revoked 数组;Compose 只读挂载)
   sample-private-keys.json   # 样例私钥(仅本地联调)
 examples/
   sample-check-signed.json   # check-signed 请求体样例

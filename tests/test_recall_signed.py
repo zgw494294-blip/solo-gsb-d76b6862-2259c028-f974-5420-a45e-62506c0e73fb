@@ -67,6 +67,15 @@ def trust_file(tmp_path, monkeypatch, private_key, other_private_key):
     return path
 
 
+@pytest.fixture
+def revocation_file(tmp_path, monkeypatch):
+    """启用单包撤销:把默认名单路径指向临时空名单,返回可改写的路径。"""
+    path = tmp_path / "revoked.json"
+    path.write_text(json.dumps({"revoked": []}), encoding="utf-8")
+    monkeypatch.setattr(signed, "DEFAULT_REVOKED_FILE", str(path))
+    return path
+
+
 def _b64url(data: bytes) -> str:
     import base64
 
@@ -124,6 +133,13 @@ def post(jws: str, *, scans=None, now: int = NOW):
         "/v1/recall/check-signed",
         json={"scans": scans if scans is not None else [SCAN], "jws": jws, "now": now},
     )
+
+
+def _package_digest(jws: str) -> str:
+    import hashlib
+
+    header_seg, payload_seg, _signature_seg = jws.split(".")
+    return hashlib.sha256(f"{header_seg}.{payload_seg}".encode("ascii")).hexdigest()
 
 
 # ---------- 正常路径 ----------
@@ -448,3 +464,147 @@ def test_signature_over_decoded_bytes_fails(private_key):
     sig = _b64url(private_key.sign(decoded))
     resp = post(f"{header_seg}.{payload_seg}.{sig}")
     assert resp.status_code == 403
+
+
+# ---------- 单包撤销 ----------
+
+
+def test_revocation_unconfigured_keeps_legacy_behavior(private_key, monkeypatch):
+    # 未配置名单(空路径):与旧行为一致,正常返回 200
+    monkeypatch.setattr(signed, "DEFAULT_REVOKED_FILE", "")
+    resp = post(make_jws(private_key, valid_payload()))
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["results"][0]["matches"] == ["recall-2026-001"]
+
+
+def test_empty_revocation_list_allows_package(private_key, revocation_file):
+    assert post(make_jws(private_key, valid_payload())).status_code == 200
+
+
+def test_revoked_package_is_403_without_results(private_key, revocation_file):
+    jws = make_jws(private_key, valid_payload())
+    digest = _package_digest(jws)
+    revocation_file.write_text(json.dumps({"revoked": [digest]}), encoding="utf-8")
+    resp = post(jws)
+    assert resp.status_code == 403, resp.text
+    body = resp.json()
+    assert digest in body["detail"]
+    assert "撤销" in body["detail"]
+    assert "results" not in body and "kid" not in body
+
+
+def test_revocation_is_single_package_per_kid(private_key, revocation_file):
+    # 同一 kid 签发两个不同载荷的包:撤销其一不连带另一个
+    jws1 = make_jws(private_key, valid_payload())
+    rule2 = {**RULE, "id": "recall-2026-002", "gtin": GTIN2}
+    scan2 = "]d2" + "01" + GTIN2 + "17" + "251231" + "10" + "LOT1" + FNC1 + "21SN9"
+    jws2 = make_jws(private_key, valid_payload(rules=[rule2]))
+    revocation_file.write_text(
+        json.dumps({"revoked": [_package_digest(jws1)]}), encoding="utf-8"
+    )
+    assert post(jws1).status_code == 403
+    resp2 = post(jws2, scans=[scan2])
+    assert resp2.status_code == 200, resp2.text
+    assert resp2.json()["results"][0]["matches"] == ["recall-2026-002"]
+
+
+def test_signature_segment_encoding_does_not_change_identity(
+    private_key, revocation_file
+):
+    # 包标识只取原始前两段:重签名 / 签名段不同,头与载荷字节一致仍命中同一摘要
+    jws = make_jws(private_key, valid_payload())
+    header_seg, payload_seg, _sig = jws.split(".")
+    other_sig = _b64url(private_key.sign(f"{header_seg}.{payload_seg}".encode("ascii")))
+    revocation_file.write_text(
+        json.dumps({"revoked": [_package_digest(jws)]}), encoding="utf-8"
+    )
+    assert post(f"{header_seg}.{payload_seg}.{other_sig}").status_code == 403
+
+
+def test_atomic_replace_takes_effect_on_next_request(
+    private_key, revocation_file, tmp_path
+):
+    import os
+
+    jws = make_jws(private_key, valid_payload())
+    digest = _package_digest(jws)
+
+    def atomic_write(revoked: list[str]) -> None:
+        tmp = revocation_file.with_name("revoked.tmp")
+        tmp.write_text(json.dumps({"revoked": revoked}), encoding="utf-8")
+        os.replace(tmp, revocation_file)  # rename(2) 原子替换
+
+    assert post(jws).status_code == 200
+    atomic_write([digest])
+    assert post(jws).status_code == 403  # 不重启,下一次请求即生效
+    atomic_write([])
+    assert post(jws).status_code == 200
+
+
+def test_duplicate_digest_entries_allowed(private_key, revocation_file):
+    jws = make_jws(private_key, valid_payload())
+    digest = _package_digest(jws)
+    revocation_file.write_text(
+        json.dumps({"revoked": [digest, digest, digest]}), encoding="utf-8"
+    )
+    assert post(jws).status_code == 403
+
+
+def test_revocation_check_runs_after_other_gates(private_key, revocation_file):
+    # 撤销名单已配置且(稍后)命中,但先于撤销的失败仍按各自状态码返回
+    jws = make_jws(private_key, valid_payload())
+    digest = _package_digest(jws)
+    revocation_file.write_text(json.dumps({"revoked": [digest]}), encoding="utf-8")
+
+    assert post(make_jws(private_key, valid_payload(), kid="nobody")).status_code == 403
+    assert post(make_jws(private_key, valid_payload(), bad_signature=True)).status_code == 403
+    assert post(jws, now=EXP).status_code == 403  # 时间窗越期
+    rule_other = {**RULE, "gtin": GTIN_OTHER}
+    assert post(make_jws(private_key, valid_payload(rules=[rule_other]))).status_code == 403
+
+
+def test_missing_revocation_file_is_500(private_key, revocation_file, monkeypatch):
+    monkeypatch.setattr(signed, "DEFAULT_REVOKED_FILE", "/nonexistent/revoked.json")
+    resp = post(make_jws(private_key, valid_payload()))
+    assert resp.status_code == 500
+    assert "results" not in resp.json()
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "not json",
+        "[]",
+        "{}",
+        '{"revoked": [],"extra": 1}',
+        '{"revoked": "x"}',
+        '{"revoked": [1]}',
+        '{"revoked": ["ABC"]}',
+        # 64 位但含大写
+        '{"revoked": ["9F86D081884C7D659A2FEAA0C55AD015A3BF4F1B2B0B822CD15D6C15B0F00A08"]}',
+        # 长度 63
+        '{"revoked": ["9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a0"]}',
+    ],
+)
+def test_invalid_revocation_list_is_500(private_key, revocation_file, content):
+    revocation_file.write_text(content, encoding="utf-8")
+    resp = post(make_jws(private_key, valid_payload()))
+    assert resp.status_code == 500, resp.text
+    assert "results" not in resp.json()
+
+
+def test_invalid_revocation_list_does_not_fallback_to_old_content(
+    private_key, revocation_file
+):
+    # 先以合法(空)名单放行,再把文件改成非法内容:不得沿用旧名单放行
+    jws = make_jws(private_key, valid_payload())
+    assert post(jws).status_code == 200
+    revocation_file.write_text("BROKEN", encoding="utf-8")
+    resp = post(jws)
+    assert resp.status_code == 500
+    assert "results" not in resp.json()
+    # 恢复为命中该包的合法名单后立即生效为 403
+    revocation_file.write_text(
+        json.dumps({"revoked": [_package_digest(jws)]}), encoding="utf-8"
+    )
+    assert post(jws).status_code == 403

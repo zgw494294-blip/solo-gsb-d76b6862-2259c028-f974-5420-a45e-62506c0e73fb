@@ -14,10 +14,18 @@ JWS 三段均为无填充 base64url:
 
 - 422:JWS 结构 / 编码 / JSON / 头部字段 / 载荷字段或规则格式非法,或请求体非法;
 - 403:未知 kid、签名验证失败、nbf/exp 越期(须 nbf <= now < exp)、
-  任一规则 GTIN 不落在该 kid 的授权前缀内;
-- 500:本地信任文件缺失或内容非法(服务端配置问题)。
+  任一规则 GTIN 不落在该 kid 的授权前缀内、规则包在本地单包撤销名单中命中;
+- 500:本地信任文件缺失或内容非法、已配置的撤销名单不可读或内容非法
+  (均为服务端配置问题)。
 
 任何 422 / 403 都不返回匹配结果。
+
+单包撤销(见 revoked.py):配置环境变量 RECALL_REVOKED_FILE 指向仅含
+"revoked" 数组(64 位小写十六进制 SHA-256 摘要,允许重复)的本地 JSON 后,
+在验签、时间窗与 GTIN 授权全部通过后,按包标识
+SHA-256(header.payload 原始两段 ASCII 字节,与签名段编码无关)命中名单即
+返回 403;同一 kid 的其他包不受影响。未配置 RECALL_REVOKED_FILE 时保持旧行为。
+名单每次请求读盘一次,宿主机原子替换后下一次请求即生效。
 """
 
 from __future__ import annotations
@@ -29,6 +37,12 @@ from pydantic import ValidationError
 from .checker import check_scans
 from .jws import JWSFormatError, b64url_decode, json_decode_b64url
 from .models import Rule, ScanResult, SignedCheckRequest, SignedCheckResponse
+from .revoked import (
+    DEFAULT_REVOKED_FILE,
+    RevocationListError,
+    load_revoked_digests,
+    package_digest,
+)
 from .trust import (
     DEFAULT_TRUST_FILE,
     TrustStoreError,
@@ -146,6 +160,23 @@ def _check_prefix_authorization(rules: list[Rule], trusted: TrustedKey) -> None:
             )
 
 
+def _check_not_revoked(header_seg: str, payload_seg: str) -> None:
+    """单包撤销:未配置名单时放行;名单不可读 / 非法按 500 失败关闭。
+
+    包标识只取 JWS 原始前两段,签名段编码变化不影响标识,因此撤销仅命中
+    该包本身,不连带同一 kid 的其他包。
+    """
+    if not DEFAULT_REVOKED_FILE:
+        return
+    try:
+        revoked = load_revoked_digests(DEFAULT_REVOKED_FILE)
+    except RevocationListError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    digest = package_digest(header_seg, payload_seg)
+    if digest in revoked:
+        raise _forbidden(f"规则包已被撤销: {digest}")
+
+
 def check_signed(request: SignedCheckRequest) -> SignedCheckResponse:
     """验签 + 时间窗 + 授权前缀全部通过后,返回 kid 与原扫码核验结果。"""
     header_seg, payload_seg, signature_seg = _split_segments(request.jws)
@@ -163,6 +194,7 @@ def check_signed(request: SignedCheckRequest) -> SignedCheckResponse:
     _verify_signature(header_seg, payload_seg, signature_seg, trusted)
     _check_time_window(nbf, exp, request.now)
     _check_prefix_authorization(rules, trusted)
+    _check_not_revoked(header_seg, payload_seg)
 
     results: list[ScanResult] = check_scans(request.scans, rules)
     return SignedCheckResponse(kid=kid, results=results)
